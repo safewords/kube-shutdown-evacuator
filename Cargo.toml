@@ -1,0 +1,22 @@
+[package]
+name = "kube-shutdown-evacuator"
+version = "0.1.0"
+edition = "2024"
+description = "Holds a Kubernetes node's shutdown until it is drained: live-migrates KubeVirt VMs, restarts the ones that can't move elsewhere"
+license = "Apache-2.0"
+repository = "https://github.com/safewords/kube-shutdown-evacuator"
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive", "env"] }
+futures = "0.3.34"
+gethostname = "0.5.0"
+jiff = "0.2"
+k8s-openapi = { version = "0.28.0", features = ["latest"] }
+kube = { version = "4.2.0", features = ["client", "derive"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "time"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+zbus = { version = "5.19.0", default-features = false, features = ["tokio"] }

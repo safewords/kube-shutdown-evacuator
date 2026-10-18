@@ -11,8 +11,9 @@ cordons and drains the node. VMs that can live-migrate do; VMs that can't are sh
 down cleanly and started again on another node. Once the node is empty, the shutdown
 continues. When the machine comes back, the node is uncordoned.
 
-It is a bash script and a systemd unit, run on each node. There is nothing to deploy
-in the cluster.
+It is a single static binary and a systemd unit, run on each node. It talks to the
+Kubernetes API through kube-rs and to logind over D-Bus through zbus, both with typed
+interfaces. There is nothing to deploy in the cluster.
 
 ## How it works
 
@@ -23,9 +24,11 @@ kubelet, the container runtime, the CSI node plugins and the network are all up.
 kube-shutdown-evacuator then:
 
 1. Cordons the node, and notes in an annotation that it did.
-2. Runs `kubectl drain`. Drain uses the Eviction API, so PodDisruptionBudgets are
-   respected and KubeVirt's eviction webhook decides what happens to each VM (see
-   [KubeVirt](#kubevirt)).
+2. Evicts every pod on the node except DaemonSet and static pods, every few seconds
+   until they have gone. Eviction goes through the Eviction API, so
+   PodDisruptionBudgets are respected and KubeVirt's eviction webhook decides what
+   happens to each VM (see [KubeVirt](#kubevirt)). DaemonSet pods (the CNI, the CSI
+   node plugins, `virt-handler`) stay up, because migrations need them.
 3. Watches the node's VM migrations. One whose target pod has not been scheduled
    after `STUCK_AFTER` seconds (the VM is pinned to this node, or no other node has
    room or a compatible CPU) is cancelled and the VMI is deleted. The guest gets a
@@ -37,13 +40,15 @@ kube-shutdown-evacuator then:
 
 On the next boot the service uncordons the node once it is Ready, but only if the
 annotation says it cordoned the node itself. A node cordoned by a person or by
-another controller stays cordoned.
+another controller stays cordoned. If the shutdown is cancelled instead
+(`PrepareForShutdown(false)`), the node is uncordoned the same way and the lock is
+taken again.
 
 ## Requirements
 
-- systemd 240 or newer (`busctl monitor --json`), with logind.
-- `kubectl` on the node, and a kubeconfig that can drain it. The script looks for
-  one in this order: `$KUBECONFIG`, `/etc/kube-shutdown-evacuator/kubeconfig`,
+- Linux with systemd-logind.
+- A kubeconfig on the node that can drain it. Without `--kubeconfig` or
+  `KUBECONFIG`, the first of these that exists is used: `/etc/kube-shutdown-evacuator/kubeconfig`,
   `/etc/rancher/k3s/k3s.yaml`, `/etc/rancher/rke2/rke2.yaml`,
   `/etc/kubernetes/admin.conf`.
 - **Kubelet graceful node shutdown turned off.** See [below](#kubelet-graceful-node-shutdown).
@@ -51,18 +56,21 @@ another controller stays cordoned.
 
 ## Install
 
-On each node, as root:
+Each [release](https://github.com/safewords/kube-shutdown-evacuator/releases) has a
+static linux/amd64 binary and the systemd files. Or build it with
+`cargo build --release`. On each node, as root:
 
 ```sh
-git clone https://github.com/safewords/kube-shutdown-evacuator
-cd kube-shutdown-evacuator
-./install.sh
+install -Dm755 kube-shutdown-evacuator-linux-amd64 /usr/local/bin/kube-shutdown-evacuator
+install -Dm644 kube-shutdown-evacuator.service /etc/systemd/system/kube-shutdown-evacuator.service
+install -Dm644 90-kube-shutdown-evacuator.conf /etc/systemd/logind.conf.d/90-kube-shutdown-evacuator.conf
+systemctl kill -s HUP systemd-logind     # reread InhibitDelayMaxSec
+systemctl daemon-reload
+systemctl enable --now kube-shutdown-evacuator
 ```
 
-This installs `/usr/local/bin/kube-shutdown-evacuator`, the
-`kube-shutdown-evacuator.service` unit, and a logind drop-in that raises
-`InhibitDelayMaxSec` to 900 seconds. Then it starts the service and checks that the
-lock is held. `./install.sh uninstall` removes all of it.
+The logind drop-in raises `InhibitDelayMaxSec`, the longest logind will wait for the
+evacuation, to 900 seconds.
 
 Check it with:
 
@@ -112,7 +120,8 @@ shutdownGracePeriodCriticalPods: 0s
 Nothing is lost: a drain terminates every pod gracefully too, and it lets each
 controller recreate its pods elsewhere first.
 
-`install.sh` warns when the kubelet still holds a shutdown lock.
+kube-shutdown-evacuator logs a warning at startup when the kubelet still holds a
+shutdown lock.
 
 ## KubeVirt
 
@@ -142,11 +151,12 @@ model: `host-passthrough` VMs can only move to an identical CPU.
 
 ## Configuration
 
-Set these in `/etc/default/kube-shutdown-evacuator`:
+Set these in `/etc/default/kube-shutdown-evacuator`, or pass them as flags
+(`kube-shutdown-evacuator --help`):
 
 | Variable | Default | |
 | --- | --- | --- |
-| `NODE` | `$(hostname)` | The Node name, if it differs from the hostname. |
+| `NODE_NAME` | the hostname | The Node name, if it differs from the hostname. |
 | `KUBECONFIG` | first one found, see [Requirements](#requirements) | |
 | `DRAIN_TIMEOUT` | `420` | Seconds for evictions and migrations before what's left is deleted in place. |
 | `FINAL_TIMEOUT` | `360` | Seconds for that deletion: the longest `terminationGracePeriodSeconds` you run, plus a margin. |
@@ -160,7 +170,7 @@ regardless.
 ## Trying it out
 
 `evacuate` and `restore` run the same steps by hand, without shutting anything down.
-Extra arguments go to `kubectl drain`, so you can limit a test to one VM:
+`--pod-selector` limits the drain to matching pods, so you can try it on one VM:
 
 ```sh
 kube-shutdown-evacuator evacuate --pod-selector=vm.kubevirt.io/name=my-test-vm
@@ -172,8 +182,6 @@ kube-shutdown-evacuator restore
 - Only shutdowns that go through logind are held: `systemctl poweroff`/`reboot`,
   `shutdown`, the power button, and anything that calls them. `systemctl poweroff --force`,
   `reboot -f`, SysRq, a kernel panic and losing power are not.
-- A shutdown cancelled after the evacuation has started leaves the node cordoned,
-  and the service stopped. `systemctl start kube-shutdown-evacuator` uncordons it.
 - Each node evacuates on its own. Shutting down several at once can leave the VMs
   nowhere to go.
 

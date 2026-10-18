@@ -5,10 +5,9 @@ After=network-online.target k3s.service k3s-agent.service rke2-server.service rk
 Wants=network-online.target
 
 [Service]
-# systemd-inhibit holds the delay lock for as long as the watcher runs; the
-# watcher exits once the node is evacuated, which lets the shutdown continue.
-ExecStart=/usr/bin/systemd-inhibit --what=shutdown --mode=delay --who=kube-shutdown-evacuator --why="Evacuating this node" /usr/local/bin/kube-shutdown-evacuator watch
-Restart=on-failure
+EnvironmentFile=-/etc/default/kube-shutdown-evacuator
+ExecStart=/usr/local/bin/kube-shutdown-evacuator watch
+Restart=always
 RestartSec=5
 
 [Install]

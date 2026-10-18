@@ -1,0 +1,28 @@
+name: release
+
+# v1.2.3 -> GitHub release with a static linux/amd64 binary and the systemd units.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  binary:
+    runs-on: safewords-runners
+    container: rust:1-bookworm
+    steps:
+      - uses: actions/checkout@v4
+      - run: apt-get update && apt-get install -y --no-install-recommends musl-tools
+      - run: rustup target add x86_64-unknown-linux-musl
+      - run: cargo build --release --locked --target x86_64-unknown-linux-musl
+      - name: Package
+        run: |
+          mkdir dist
+          cp target/x86_64-unknown-linux-musl/release/kube-shutdown-evacuator dist/kube-shutdown-evacuator-linux-amd64
+          cp systemd/* dist/
+          cd dist && sha256sum * > SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
