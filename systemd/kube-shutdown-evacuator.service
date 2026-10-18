@@ -1,0 +1,15 @@
+[Unit]
+Description=Evacuate this Kubernetes node before it shuts down
+Documentation=https://github.com/safewords/kube-shutdown-evacuator
+After=network-online.target k3s.service k3s-agent.service rke2-server.service rke2-agent.service kubelet.service
+Wants=network-online.target
+
+[Service]
+# systemd-inhibit holds the delay lock for as long as the watcher runs; the
+# watcher exits once the node is evacuated, which lets the shutdown continue.
+ExecStart=/usr/bin/systemd-inhibit --what=shutdown --mode=delay --who=kube-shutdown-evacuator --why="Evacuating this node" /usr/local/bin/kube-shutdown-evacuator watch
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

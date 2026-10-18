@@ -1,0 +1,22 @@
+name: ci
+
+# Runs on the self-hosted ARC scale set `safewords-runners`.
+# Pull requests from forks never run on self-hosted runners: they could execute
+# arbitrary code inside the cluster hosting the runners.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  shellcheck:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: safewords-runners
+    steps:
+      - uses: actions/checkout@v4
+      - run: curl -fsSL https://github.com/koalaman/shellcheck/releases/download/v0.10.0/shellcheck-v0.10.0.linux.x86_64.tar.xz | tar -xJ --strip-components=1 shellcheck-v0.10.0/shellcheck
+      - run: ./shellcheck bin/kube-shutdown-evacuator install.sh

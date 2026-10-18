@@ -1,0 +1,140 @@
+#!/bin/bash
+# Evacuates a Kubernetes node before the machine powers off or reboots: live-
+# migrates its KubeVirt VMs where it can, and drains everything else.
+#
+#   kube-shutdown-evacuator watch      hold a logind shutdown-delay lock; evacuate when a shutdown starts
+#   kube-shutdown-evacuator evacuate   cordon and drain this node now (extra args go to kubectl drain)
+#   kube-shutdown-evacuator restore    uncordon this node, if an earlier evacuation cordoned it
+#
+# Draining goes through the Eviction API, so KubeVirt's evictionStrategy decides
+# what each VM does: LiveMigrateIfPossible live-migrates a migratable VM and lets
+# any other one be shut down, after which its VM controller starts it again on
+# another node. A migration whose target pod cannot be scheduled (the VM is
+# pinned here, or no other node has room or a compatible CPU) is abandoned after
+# STUCK_AFTER seconds and the VM is shut down cleanly instead.
+#
+# The lock is what makes this work: logind holds the shutdown until we let go,
+# so nothing is stopped while VMs are still migrating. Kubelet's own graceful
+# node shutdown takes the same kind of lock and kills pods outright, so it must
+# be off (shutdownGracePeriod: 0s) on nodes running this.
+
+set -u
+
+# shellcheck source=/dev/null
+[ -r /etc/default/kube-shutdown-evacuator ] && . /etc/default/kube-shutdown-evacuator
+NODE=${NODE:-$(hostname)}
+# Whole budget for evictions and migrations. Whatever is left afterwards is
+# deleted in place, which can take up to FINAL_TIMEOUT more, so logind's
+# InhibitDelayMaxSec has to cover both.
+DRAIN_TIMEOUT=${DRAIN_TIMEOUT:-420}
+FINAL_TIMEOUT=${FINAL_TIMEOUT:-360}
+STUCK_AFTER=${STUCK_AFTER:-60}
+ANNOTATION=${ANNOTATION:-kube-shutdown-evacuator/cordoned-at}
+
+# kubectl and a kubeconfig, wherever the distribution keeps them.
+PATH=$PATH:/usr/local/bin:/var/lib/rancher/rke2/bin
+if [ -z "${KUBECONFIG:-}" ]; then
+    for f in /etc/kube-shutdown-evacuator/kubeconfig /etc/rancher/k3s/k3s.yaml \
+        /etc/rancher/rke2/rke2.yaml /etc/kubernetes/admin.conf; do
+        [ -r "$f" ] && { KUBECONFIG=$f; break; }
+    done
+fi
+export PATH KUBECONFIG
+
+log() { echo "kube-shutdown-evacuator: $*"; }
+
+# Prints "namespace name" for each VMI on this node; nothing without KubeVirt.
+vmis_here() {
+    kubectl get vmi -A -l "kubevirt.io/nodeName=$NODE" \
+        -o go-template='{{range .items}}{{.metadata.namespace}} {{.metadata.name}}{{"\n"}}{{end}}' 2>/dev/null
+}
+
+# Gives up on migrations that have had no running target pod for STUCK_AFTER
+# seconds, and deletes their VMI so the guest shuts down cleanly here and its VM
+# starts again wherever it is allowed to.
+declare -A scheduling_since
+give_up_stuck_migrations() {
+    local ns vmi mig phase
+    while read -r ns vmi; do
+        [ -n "$vmi" ] || continue
+        while read -r mig phase; do
+            [ "$phase" = Scheduling ] || continue
+            : "${scheduling_since[$ns/$mig]:=$SECONDS}"
+            if (( SECONDS - scheduling_since[$ns/$mig] >= STUCK_AFTER )); then
+                log "migration $ns/$mig has no target after ${STUCK_AFTER}s; shutting $ns/$vmi down so it restarts elsewhere"
+                kubectl delete vmi -n "$ns" "$vmi" --wait=false
+                kubectl delete vmim -n "$ns" "$mig" --wait=false
+            fi
+        done < <(kubectl get vmim -n "$ns" -o go-template='{{range .items}}{{if eq .spec.vmiName "'"$vmi"'"}}{{.metadata.name}} {{.status.phase}}{{"\n"}}{{end}}{{end}}')
+    done < <(vmis_here)
+}
+
+evacuate() {
+    log "evacuating $NODE"
+    # Only a node we cordoned is ours to uncordon on the way back up; one that
+    # a person or another controller cordoned stays that way.
+    if [ "$(kubectl get node "$NODE" -o jsonpath='{.spec.unschedulable}')" != true ]; then
+        kubectl annotate node "$NODE" --overwrite "$ANNOTATION=$(date -u +%FT%TZ)"
+    fi
+    kubectl cordon "$NODE"
+
+    kubectl drain "$NODE" --ignore-daemonsets --delete-emptydir-data --force \
+        --timeout="${DRAIN_TIMEOUT}s" "$@" &
+    local drain=$!
+    while kill -0 "$drain" 2>/dev/null; do
+        give_up_stuck_migrations
+        sleep 5
+    done
+    if wait "$drain"; then
+        log "drained $NODE"
+        return 0
+    fi
+
+    log "drain did not finish in ${DRAIN_TIMEOUT}s; deleting what is left in place"
+    local ns vmi
+    while read -r ns vmi; do
+        [ -n "$vmi" ] && kubectl delete vmi -n "$ns" "$vmi" --wait=false
+    done < <(vmis_here)
+    kubectl drain "$NODE" --ignore-daemonsets --delete-emptydir-data --force \
+        --disable-eviction --timeout="${FINAL_TIMEOUT}s" "$@"
+}
+
+restore() {
+    until kubectl get node "$NODE" >/dev/null 2>&1; do sleep 5; done
+    [ -n "$(kubectl get node "$NODE" -o jsonpath="{.metadata.annotations['${ANNOTATION//./\\.}']}")" ] || return 0
+    until [ "$(kubectl get node "$NODE" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}')" = True ]; do
+        sleep 5
+    done
+    kubectl uncordon "$NODE" && kubectl annotate node "$NODE" "$ANNOTATION-"
+    log "uncordoned $NODE"
+}
+
+watch() {
+    restore &
+    # Only logind itself may send this; the sender match keeps anyone else on
+    # the bus from triggering an evacuation.
+    coproc MONITOR {
+        exec busctl monitor --json=short --match \
+            "type='signal',sender='org.freedesktop.login1',path='/org/freedesktop/login1',interface='org.freedesktop.login1.Manager',member='PrepareForShutdown'"
+    }
+    local line
+    while read -r line <&"${MONITOR[0]}"; do
+        case $line in
+            *'"data":[true]'*)
+                kill "$MONITOR_PID"
+                evacuate
+                # Exiting releases the lock and lets the shutdown go on.
+                exit 0
+                ;;
+        esac
+    done
+    # busctl went away without a shutdown: fail, so systemd starts us again.
+    exit 1
+}
+
+case ${1:-} in
+    watch) watch ;;
+    evacuate) shift; evacuate "$@" ;;
+    restore) restore ;;
+    *) echo "usage: $0 watch | evacuate [kubectl drain flags] | restore" >&2; exit 2 ;;
+esac

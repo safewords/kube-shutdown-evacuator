@@ -1,0 +1,52 @@
+# Credentials for nodes that have no admin kubeconfig of their own (worker
+# nodes, usually). Everything it grants is what draining needs, but for every
+# node: whoever holds the token can evict any pod in the cluster. See the
+# README for turning the token into /etc/kube-shutdown-evacuator/kubeconfig.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kube-shutdown-evacuator
+  namespace: kube-system
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: kube-shutdown-evacuator-token
+  namespace: kube-system
+  annotations:
+    kubernetes.io/service-account.name: kube-shutdown-evacuator
+type: kubernetes.io/service-account-token
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kube-shutdown-evacuator
+rules:
+  - apiGroups: [""]
+    resources: [nodes]
+    verbs: [get, list, patch]
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list, delete]
+  - apiGroups: [""]
+    resources: [pods/eviction]
+    verbs: [create]
+  - apiGroups: [apps]
+    resources: [daemonsets]
+    verbs: [get]
+  - apiGroups: [kubevirt.io]
+    resources: [virtualmachineinstances, virtualmachineinstancemigrations]
+    verbs: [get, list, delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kube-shutdown-evacuator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kube-shutdown-evacuator
+subjects:
+  - kind: ServiceAccount
+    name: kube-shutdown-evacuator
+    namespace: kube-system
